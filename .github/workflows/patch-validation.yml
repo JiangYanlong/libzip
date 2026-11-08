@@ -1,0 +1,107 @@
+name: Validate reviewed libzip AES patch
+
+'on':
+  push:
+    branches:
+      - ci/libzip-aes-linux
+
+permissions:
+  contents: read
+
+jobs:
+  linux-openssl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      LIBZIP_PATCH_SHA: 20ccdcfed4574b53b5244d8348092effce3c892a
+    steps:
+      - name: Check out the reviewed source revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: JiangYanlong/libzip
+          ref: 20ccdcfed4574b53b5244d8348092effce3c892a
+          persist-credentials: false
+
+      - name: Verify source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "$LIBZIP_PATCH_SHA"
+          git diff --exit-code
+
+      - name: Install build and test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3-venv pkg-config \
+            bzip2 zlib1g-dev libssl-dev libbz2-dev libzstd-dev \
+            liblzma-dev libreadline-dev libcmocka-dev
+          python3 -m venv "$RUNNER_TEMP/libzip-ci-venv"
+          "$RUNNER_TEMP/libzip-ci-venv/bin/python" -m pip install nihtest==1.11.1
+
+      - name: Configure Linux OpenSSL Release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S "$GITHUB_WORKSPACE" -B "$RUNNER_TEMP/libzip-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DREQUIRE_ALL_TESTS=ON \
+            -DENABLE_COMMONCRYPTO=OFF -DENABLE_GNUTLS=OFF \
+            -DENABLE_WINDOWS_CRYPTO=OFF -DENABLE_OPENSSL=ON \
+            -DNIHTEST="$RUNNER_TEMP/libzip-ci-venv/bin/nihtest"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          header = (Path(os.environ['RUNNER_TEMP']) / 'libzip-build/config.h').read_text()
+          assert '#define HAVE_CRYPTO' in header, 'AES support was not enabled'
+          assert '#define HAVE_OPENSSL' in header, 'OpenSSL was not selected'
+          print(json.dumps({'aes_enabled': True, 'backend': 'OpenSSL',
+                            'native_timingsafe_bcmp': '#define HAVE_TIMINGSAFE_BCMP' in header}))
+          PY
+
+      - name: Build all targets and exercise comparison unit cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build "$RUNNER_TEMP/libzip-build" --config Release --parallel 2
+          "$RUNNER_TEMP/libzip-build/regress/crypto_equal"
+
+      - name: Run complete CTest suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir "$RUNNER_TEMP/libzip-build" --build-config Release \
+            --output-on-failure --no-tests=error --timeout 120 --parallel 2 \
+            --output-junit "$RUNNER_TEMP/libzip-results.xml"
+
+      - name: Summarize actual tests and AES coverage
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          report = Path(os.environ['RUNNER_TEMP']) / 'libzip-results.xml'
+          if not report.exists():
+              print('No CTest report was produced; do not claim tests ran.')
+              raise SystemExit(0)
+          cases = ET.parse(report).getroot().findall('.//testcase')
+          failed = [c.attrib['name'] for c in cases if c.find('failure') is not None or c.find('error') is not None]
+          skipped = [c.attrib['name'] for c in cases if c.find('skipped') is not None]
+          focus = [c.attrib['name'] for c in cases if re.search(r'(^crypto_equal$|^(decrypt-|encryption-).*aes|^hmac-error\.test$)', c.attrib['name'])]
+          summary = {'source_revision': os.environ['LIBZIP_PATCH_SHA'],
+                     'ctest_total': len(cases), 'ctest_failed': len(failed),
+                     'ctest_skipped': len(skipped),
+                     'ctest_passed': len(cases) - len(failed) - len(skipped),
+                     'failed_tests': failed, 'skipped_tests': skipped,
+                     'comparison_and_aes_tests': focus}
+          print('LIBZIP_CI_RESULT=' + json.dumps(summary, sort_keys=True))
+          assert cases and not failed, 'CTest did not pass'
+          assert 'crypto_equal' in focus and len(focus) >= 10, 'Expected comparison/AES tests are missing'
+          assert not set(focus).intersection(skipped), 'Comparison/AES tests were skipped'
+          PY
