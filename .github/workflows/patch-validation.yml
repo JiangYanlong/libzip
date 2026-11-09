@@ -38,9 +38,24 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build python3-venv pkg-config \
             bzip2 zlib1g-dev libssl-dev libbz2-dev libzstd-dev \
-            liblzma-dev libreadline-dev libcmocka-dev
+            liblzma-dev libreadline-dev
           python3 -m venv "$RUNNER_TEMP/libzip-ci-venv"
           "$RUNNER_TEMP/libzip-ci-venv/bin/python" -m pip install nihtest==1.11.1
+
+      - name: Build the CMocka version used for local validation
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 2 \
+            --output cmocka-2.0.2.tar.xz https://cmocka.org/files/2.0/cmocka-2.0.2.tar.xz
+          printf '%s\n' '39f92f366bdf3f1a02af4da75b4a5c52df6c9f7e736c7d65de13283f9f0ef416  cmocka-2.0.2.tar.xz' | sha256sum --check --strict
+          tar -xf cmocka-2.0.2.tar.xz
+          cmake -S cmocka-2.0.2 -B cmocka-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/libzip-cmocka"
+          cmake --build cmocka-build --parallel 2
+          cmake --install cmocka-build
 
       - name: Configure Linux OpenSSL Release build
         shell: bash
@@ -51,6 +66,8 @@ jobs:
             -DREQUIRE_ALL_TESTS=ON \
             -DENABLE_COMMONCRYPTO=OFF -DENABLE_GNUTLS=OFF \
             -DENABLE_WINDOWS_CRYPTO=OFF -DENABLE_OPENSSL=ON \
+            -DCMOCKA_INCLUDE_DIR="$RUNNER_TEMP/libzip-cmocka/include" \
+            -DCMOCKA_LIBRARY="$RUNNER_TEMP/libzip-cmocka/lib/libcmocka.so" \
             -DNIHTEST="$RUNNER_TEMP/libzip-ci-venv/bin/nihtest"
           python3 - <<'PY'
           import json, os
